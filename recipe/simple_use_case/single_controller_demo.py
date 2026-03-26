@@ -164,12 +164,15 @@ async def generate(prompt: torch.Tensor, response_length: int, vocab_size: int) 
 
 
 class AgentLoop():
-    def __init__(self, config):
-        pass
+    def __init__(self, config, tokenizer):
+        self.config = config
+        self.tokenizer = tokenizer
+        
 
     
-    async def run(self):
-        pass
+    async def run(self, messages):
+        # apply chat template
+        prompt_ids = self.tokenizer.apply_chat_template(messages)
 
 
 
