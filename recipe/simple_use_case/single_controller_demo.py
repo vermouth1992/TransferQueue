@@ -238,13 +238,13 @@ class AgentLoop:
     def __init__(self, config: AgentLoopConfig):
         self.config = config
 
-    async def run(self, messages: list[dict]) -> torch.Tensor:
-        """Execute a multi-turn rollout starting from *messages*.
+    async def run(self, data: TensorDict) -> TensorDict:
+        """Execute a multi-turn rollout for a single sample.
 
         Args:
-            messages: OpenAI-style multi-modal message list.  ``content``
-                is a list of typed parts (``"text"`` / ``"image_url"``).
-                Example::
+            data: ``TensorDict`` with ``batch_size=1``.  Must contain a
+                ``"messages"`` field (stored via ``NonTensorStack``) holding
+                an OpenAI-style message list, e.g.::
 
                     [{"role": "user",
                       "content": [
@@ -255,13 +255,21 @@ class AgentLoop:
                       ]}]
 
         Returns:
-            1-D ``torch.Tensor`` of token IDs for the full conversation
-            (prompt + all generation turns + tool responses).
+            ``TensorDict`` with ``batch_size=1`` containing:
+
+            - ``"generate_sequences_ids"`` — the full conversation token
+              IDs (prompt + all turns + tool responses), shape
+              ``[1, total_len]``.
+            - ``"num_turns"`` — how many generation turns were executed,
+              shape ``[1]``.
         """
         cfg = self.config
         min_turns, max_turns = cfg.max_turns_range
         num_turns = random.randint(min_turns, max_turns)
 
+        assert data.batch_size[0] == 1, "batch_size must be 1"
+
+        messages = data["messages"].tolist()[0]
         conversation = simulate_chat_template(messages, cfg.vocab_size, cfg.image_token_length)
         logger.info(
             f"AgentLoop: initial prompt length = {conversation.shape[0]}, "
@@ -287,7 +295,13 @@ class AgentLoop:
                 f"tool-response tokens, conversation length = {conversation.shape[0]}"
             )
 
-        return conversation
+        return TensorDict(
+            {
+                "generate_sequences_ids": conversation.unsqueeze(0),
+                "num_turns": torch.tensor([turn + 1]),
+            },
+            batch_size=1,
+        )
 
     def _detect_tool_call(self, turn: int, num_turns: int) -> bool:
         """Simulate tool-call detection.
