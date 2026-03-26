@@ -20,6 +20,7 @@ import random
 import sys
 import time
 import uuid
+from dataclasses import dataclass, field
 from importlib import resources
 from pathlib import Path
 
@@ -163,16 +164,137 @@ async def generate(prompt: torch.Tensor, response_length: int, vocab_size: int) 
 
 
 
-class AgentLoop():
-    def __init__(self, config, tokenizer):
-        self.config = config
-        self.tokenizer = tokenizer
-        
+IMAGE_TOKEN_ID = 32001
 
-    
-    async def run(self, messages):
-        # apply chat template
-        prompt_ids = self.tokenizer.apply_chat_template(messages)
+
+def simulate_chat_template(
+    messages: list[dict], vocab_size: int, image_token_length: int = 64
+) -> torch.Tensor:
+    """Simulate ``tokenizer.apply_chat_template`` with interleaved image support.
+
+    Each message dict may contain:
+
+    - ``"content"`` *(str)* — text that is tokenised as one random ID per
+      whitespace-delimited word.
+    - ``"images"`` *(list[torch.Tensor | tuple])* — a list of images.  Each
+      image is represented by ``image_token_length`` placeholder tokens
+      (simulating the patch embeddings a vision encoder would produce).
+      An image can be an actual ``torch.Tensor`` (e.g. ``(3, H, W)``) or
+      just a shape tuple — only the *count* matters here.
+
+    The resulting token sequence interleaves text and image tokens in the
+    order they appear within each message.
+
+    Args:
+        messages: Chat-style message list.
+        vocab_size: Vocabulary size for random text token IDs.
+        image_token_length: Number of placeholder tokens per image.
+
+    Returns:
+        1-D ``torch.Tensor`` of token IDs.
+    """
+    tokens: list[int] = []
+    for msg in messages:
+        content = msg.get("content", "")
+        if content:
+            tokens.extend(torch.randint(0, vocab_size, (len(content.split()),)).tolist())
+
+        for _img in msg.get("images", []):
+            tokens.extend([IMAGE_TOKEN_ID] * image_token_length)
+
+    return torch.tensor(tokens, dtype=torch.long)
+
+
+@dataclass
+class AgentLoopConfig:
+    """Configuration for :class:`AgentLoop` multi-turn rollout."""
+
+    max_turns_range: tuple[int, int] = (1, 4)
+    tool_response_length_range: tuple[int, int] = (5, 20)
+    vocab_size: int = 32000
+    response_length: int = 32
+    image_token_length: int = 64
+
+
+class AgentLoop:
+    """Multi-turn agentic rollout that interleaves LLM generation with tool calls.
+
+    Each turn:
+      1. Call ``generate()`` to produce a model response.
+      2. Check whether the response triggers a tool call.
+      3. If yes, simulate tool execution and append the tool-response tokens.
+      4. Repeat until no tool call is detected or ``max_turns`` is reached.
+    """
+
+    def __init__(self, config: AgentLoopConfig):
+        self.config = config
+
+    async def run(self, messages: list[dict]) -> torch.Tensor:
+        """Execute a multi-turn rollout starting from *messages*.
+
+        Args:
+            messages: Chat-style message list.  Each dict may contain
+                ``"content"`` (text) and ``"images"`` (list of tensors).
+                Example::
+
+                    [{"role": "user",
+                      "content": "Describe this photo",
+                      "images": [torch.randn(3, 224, 224)]}]
+
+        Returns:
+            1-D ``torch.Tensor`` of token IDs for the full conversation
+            (prompt + all generation turns + tool responses).
+        """
+        cfg = self.config
+        min_turns, max_turns = cfg.max_turns_range
+        num_turns = random.randint(min_turns, max_turns)
+
+        conversation = simulate_chat_template(messages, cfg.vocab_size, cfg.image_token_length)
+        logger.info(
+            f"AgentLoop: initial prompt length = {conversation.shape[0]}, "
+            f"sampled {num_turns} turns (range {cfg.max_turns_range})"
+        )
+
+        for turn in range(num_turns):
+            response = await generate(conversation, cfg.response_length, cfg.vocab_size)
+            conversation = torch.cat([conversation, response])
+            logger.info(
+                f"AgentLoop turn {turn}/{num_turns}: generated {response.shape[0]} tokens, "
+                f"conversation length = {conversation.shape[0]}"
+            )
+
+            if not self._detect_tool_call(turn, num_turns):
+                logger.info(f"AgentLoop turn {turn}: final answer produced, rollout complete.")
+                break
+
+            tool_response = self._simulate_tool_response()
+            conversation = torch.cat([conversation, tool_response])
+            logger.info(
+                f"AgentLoop turn {turn}: tool call → appended {tool_response.shape[0]} "
+                f"tool-response tokens, conversation length = {conversation.shape[0]}"
+            )
+
+        return conversation
+
+    def _detect_tool_call(self, turn: int, num_turns: int) -> bool:
+        """Simulate tool-call detection.
+
+        In a real agent this would parse the decoded model output for
+        tool-call syntax (e.g. function-call JSON).  Here we
+        deterministically issue a tool call on every turn except the last
+        one, guaranteeing multi-turn behaviour in the demo.
+        """
+        return turn < num_turns - 1
+
+    def _simulate_tool_response(self) -> torch.Tensor:
+        """Simulate tool execution returning random token IDs.
+
+        The response length is sampled uniformly from
+        ``[tool_response_length_range[0], tool_response_length_range[1]]``.
+        """
+        min_len, max_len = self.config.tool_response_length_range
+        length = random.randint(min_len, max_len)
+        return torch.randint(0, self.config.vocab_size, (length,), dtype=torch.long)
 
 
 
@@ -320,6 +442,12 @@ if __name__ == "__main__":
             "num_global_batch": 1,
             "rollout_agent_num_workers": 2,
             "num_n_samples": 2,
+            # AgentLoop multi-turn rollout settings
+            "max_turns_range": [1, 4],
+            "tool_response_length_range": [5, 20],
+            "vocab_size": 32000,
+            "response_length": 32,
+            "image_token_length": 64,
         }
     )
 
