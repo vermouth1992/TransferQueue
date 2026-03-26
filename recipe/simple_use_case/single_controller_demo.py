@@ -155,6 +155,25 @@ class AsyncvLLMServer:
         return kv_meta
 
 
+
+async def generate(prompt: torch.Tensor, response_length: int, vocab_size: int) -> torch.Tensor:
+    assert prompt.ndim == 1
+    response = torch.randint(low=0, high=vocab_size, size=(response_length,), dtype=torch.long)
+    return response
+
+
+
+class AgentLoop():
+    def __init__(self, config):
+        pass
+
+    
+    async def run(self):
+        pass
+
+
+
+
 @ray.remote(num_cpus=1)
 class AgentLoopWorker:
     def __init__(self, config):
