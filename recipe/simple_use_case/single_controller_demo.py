@@ -172,18 +172,19 @@ def simulate_chat_template(
 ) -> torch.Tensor:
     """Simulate ``tokenizer.apply_chat_template`` with interleaved image support.
 
-    Each message dict may contain:
+    Each message follows the OpenAI-style multi-modal format::
 
-    - ``"content"`` *(str)* — text that is tokenised as one random ID per
-      whitespace-delimited word.
-    - ``"images"`` *(list[torch.Tensor | tuple])* — a list of images.  Each
-      image is represented by ``image_token_length`` placeholder tokens
-      (simulating the patch embeddings a vision encoder would produce).
-      An image can be an actual ``torch.Tensor`` (e.g. ``(3, H, W)``) or
-      just a shape tuple — only the *count* matters here.
+        {"role": "user",
+         "content": [
+             {"type": "image_url", "image_url": {"url": "..."}},
+             {"type": "text", "text": "Describe this image"},
+         ]}
 
-    The resulting token sequence interleaves text and image tokens in the
-    order they appear within each message.
+    ``content`` may also be a plain string for text-only messages.
+
+    - ``"text"`` parts are tokenised as one random ID per whitespace word.
+    - ``"image_url"`` parts each produce ``image_token_length`` placeholder
+      tokens (simulating the patch embeddings a vision encoder would emit).
 
     Args:
         messages: Chat-style message list.
@@ -196,11 +197,19 @@ def simulate_chat_template(
     tokens: list[int] = []
     for msg in messages:
         content = msg.get("content", "")
-        if content:
-            tokens.extend(torch.randint(0, vocab_size, (len(content.split()),)).tolist())
 
-        for _img in msg.get("images", []):
-            tokens.extend([IMAGE_TOKEN_ID] * image_token_length)
+        if isinstance(content, str):
+            if content:
+                tokens.extend(torch.randint(0, vocab_size, (len(content.split()),)).tolist())
+        elif isinstance(content, list):
+            for part in content:
+                part_type = part.get("type", "")
+                if part_type == "text":
+                    text = part.get("text", "")
+                    if text:
+                        tokens.extend(torch.randint(0, vocab_size, (len(text.split()),)).tolist())
+                elif part_type == "image_url":
+                    tokens.extend([IMAGE_TOKEN_ID] * image_token_length)
 
     return torch.tensor(tokens, dtype=torch.long)
 
@@ -233,13 +242,17 @@ class AgentLoop:
         """Execute a multi-turn rollout starting from *messages*.
 
         Args:
-            messages: Chat-style message list.  Each dict may contain
-                ``"content"`` (text) and ``"images"`` (list of tensors).
+            messages: OpenAI-style multi-modal message list.  ``content``
+                is a list of typed parts (``"text"`` / ``"image_url"``).
                 Example::
 
                     [{"role": "user",
-                      "content": "Describe this photo",
-                      "images": [torch.randn(3, 224, 224)]}]
+                      "content": [
+                          {"type": "image_url",
+                           "image_url": {"url": "https://...jpg"}},
+                          {"type": "text",
+                           "text": "Describe this image"},
+                      ]}]
 
         Returns:
             1-D ``torch.Tensor`` of token IDs for the full conversation
