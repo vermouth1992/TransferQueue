@@ -257,9 +257,12 @@ class AgentLoop:
         Returns:
             ``TensorDict`` with ``batch_size=1`` containing:
 
-            - ``"generate_sequences_ids"`` — the full conversation token
-              IDs (prompt + all turns + tool responses), shape
-              ``[1, total_len]``.
+            - ``"prompt"`` — token IDs of the original message, shape
+              ``[1, prompt_len]``.
+            - ``"response"`` — all generated tokens (generations + tool
+              responses across every turn), shape ``[1, response_len]``.
+            - ``"response_mask"`` — ``1`` for model-generated tokens,
+              ``0`` for tool-response tokens, shape ``[1, response_len]``.
             - ``"num_turns"`` — how many generation turns were executed,
               shape ``[1]``.
         """
@@ -270,17 +273,23 @@ class AgentLoop:
         assert data.batch_size[0] == 1, "batch_size must be 1"
 
         messages = data["messages"].tolist()[0]
-        conversation = simulate_chat_template(messages, cfg.vocab_size, cfg.image_token_length)
+        prompt = simulate_chat_template(messages, cfg.vocab_size, cfg.image_token_length)
         logger.info(
-            f"AgentLoop: initial prompt length = {conversation.shape[0]}, "
+            f"AgentLoop: initial prompt length = {prompt.shape[0]}, "
             f"sampled {num_turns} turns (range {cfg.max_turns_range})"
         )
 
+        conversation = prompt.clone()
+        response_parts: list[torch.Tensor] = []
+        mask_parts: list[torch.Tensor] = []
+
         for turn in range(num_turns):
-            response = await generate(conversation, cfg.response_length, cfg.vocab_size)
-            conversation = torch.cat([conversation, response])
+            gen = await generate(conversation, cfg.response_length, cfg.vocab_size)
+            conversation = torch.cat([conversation, gen])
+            response_parts.append(gen)
+            mask_parts.append(torch.ones(gen.shape[0], dtype=torch.long))
             logger.info(
-                f"AgentLoop turn {turn}/{num_turns}: generated {response.shape[0]} tokens, "
+                f"AgentLoop turn {turn}/{num_turns}: generated {gen.shape[0]} tokens, "
                 f"conversation length = {conversation.shape[0]}"
             )
 
@@ -290,14 +299,21 @@ class AgentLoop:
 
             tool_response = self._simulate_tool_response()
             conversation = torch.cat([conversation, tool_response])
+            response_parts.append(tool_response)
+            mask_parts.append(torch.zeros(tool_response.shape[0], dtype=torch.long))
             logger.info(
                 f"AgentLoop turn {turn}: tool call → appended {tool_response.shape[0]} "
                 f"tool-response tokens, conversation length = {conversation.shape[0]}"
             )
 
+        response = torch.cat(response_parts) if response_parts else torch.tensor([], dtype=torch.long)
+        response_mask = torch.cat(mask_parts) if mask_parts else torch.tensor([], dtype=torch.long)
+
         return TensorDict(
             {
-                "generate_sequences_ids": conversation.unsqueeze(0),
+                "prompt": prompt.unsqueeze(0),
+                "response": response.unsqueeze(0),
+                "response_mask": response_mask.unsqueeze(0),
                 "num_turns": torch.tensor([turn + 1]),
             },
             batch_size=1,
