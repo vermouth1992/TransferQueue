@@ -27,7 +27,7 @@ from pathlib import Path
 import ray
 import torch
 from omegaconf import OmegaConf
-from tensordict import NonTensorData, TensorDict
+from tensordict import TensorDict
 from tensordict.tensorclass import NonTensorStack
 from torch.utils.data import DataLoader, Dataset
 
@@ -52,11 +52,6 @@ def compute_log_prob(data1, _data2):
 def compute_loss(data1, _data2):
     time.sleep(3)
     return data1
-
-
-def generate_sequences(data):
-    time.sleep(3)
-    return data
 
 
 class TrainingWorker:
@@ -125,36 +120,6 @@ class ActorRolloutRefWorker:
         # Simulate weight sync from actor to rollout
         logger.info(f"update_weights: syncing weights at step {global_steps}")
         await asyncio.sleep(1)
-
-
-@ray.remote
-class AsyncvLLMServer:
-    def __init__(self, config):
-        tq.init(config)
-
-    async def generate(self, kv_meta: KVBatchMeta) -> KVBatchMeta:
-        data = tq.kv_batch_get_by_meta(meta=kv_meta)
-        logger.info(f"demo get data -> generate_sequences {data}")
-
-        data = data["input_ids"]
-        data += 1
-        await asyncio.sleep(3)
-
-        output = TensorDict(
-            {
-                "generate_sequences_ids": data,
-                "non_tensor_data": torch.stack([NonTensorData("test_str") for _ in range(data.size(0))]),
-                "nested_tensor": torch.nested.as_nested_tensor(
-                    [torch.randn(1, 2) for _ in range(data.size(0))], layout=torch.jagged
-                ),
-            },
-            batch_size=data.size(0),
-        )
-
-        kv_meta = tq.kv_batch_put(keys=kv_meta.keys, partition_id=kv_meta.partition_id, fields=output)
-        logger.info("demo Async Server put data to storages done")
-
-        return kv_meta
 
 
 
@@ -396,8 +361,6 @@ class AgentLoop:
         return torch.randint(0, self.config.vocab_size, (length,), dtype=torch.long)
 
 
-
-
 @ray.remote(num_cpus=1)
 class AgentLoopWorker:
     def __init__(self, tq_config, agent_loop_config: AgentLoopConfig):
@@ -458,15 +421,18 @@ class TrainerConfig:
 
     global_batch_size: int = 8
     rollout_agent_num_workers: int = 2
-    num_n_samples: int = 2
+    vocab_size: int = 32000
     agent_loop: AgentLoopConfig = field(default_factory=AgentLoopConfig)
     dataset: MessageDatasetConfig = field(default_factory=MessageDatasetConfig)
+
+    def __post_init__(self):
+        self.agent_loop.vocab_size = self.vocab_size
+        self.dataset.vocab_size = self.vocab_size
 
 
 class Trainer:
     def __init__(self, config: TrainerConfig, tq_config):
         self.config = config
-        self.tq_config = tq_config
         tq.init(tq_config)
         self.tq_client = tq.get_client()
         self.actor_rollout_wg = ActorRolloutRefWorker()
@@ -549,23 +515,19 @@ class Trainer:
 if __name__ == "__main__":
     ray.init()
 
-    vocab_size = 32000
-
     trainer_config = TrainerConfig(
         global_batch_size=8,
         rollout_agent_num_workers=2,
-        num_n_samples=2,
+        vocab_size=32000,
         agent_loop=AgentLoopConfig(
             max_turns_range=(1, 4),
             tool_response_length_range=(5, 20),
-            vocab_size=vocab_size,
             response_length=32,
             image_token_length=64,
         ),
         dataset=MessageDatasetConfig(
             num_samples=32,
             text_length_range=(10, 128),
-            vocab_size=vocab_size,
             num_images_range=(0, 3),
         ),
     )
