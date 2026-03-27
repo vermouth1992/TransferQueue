@@ -278,6 +278,8 @@ class AgentLoop:
         Returns:
             ``TensorDict`` with ``batch_size=1`` containing:
 
+            - ``"input_ids"`` — concatenation of prompt and response,
+              shape ``[1, prompt_len + response_len]``.
             - ``"prompt"`` — token IDs of the original message, shape
               ``[1, prompt_len]``.
             - ``"response"`` — all generated tokens (generations + tool
@@ -293,7 +295,7 @@ class AgentLoop:
 
         assert data.batch_size[0] == 1, "batch_size must be 1"
 
-        messages = data["messages"].tolist()[0]
+        messages = list(data["messages"])[0]
         prompt = simulate_chat_template(messages, cfg.vocab_size, cfg.image_token_length)
         logger.info(
             f"AgentLoop: initial prompt length = {prompt.shape[0]}, "
@@ -329,9 +331,11 @@ class AgentLoop:
 
         response = torch.cat(response_parts) if response_parts else torch.tensor([], dtype=torch.long)
         response_mask = torch.cat(mask_parts) if mask_parts else torch.tensor([], dtype=torch.long)
+        input_ids = torch.cat([prompt, response])
 
         return TensorDict(
             {
+                "input_ids": input_ids.unsqueeze(0),
                 "prompt": prompt.unsqueeze(0),
                 "response": response.unsqueeze(0),
                 "response_mask": response_mask.unsqueeze(0),
@@ -368,28 +372,22 @@ class AgentLoopWorker:
         self.agent_loop_config = agent_loop_config
 
     async def generate_sequences(self, kv_meta_chunk):
-        if isinstance(kv_meta_chunk, list):
-            tasks = []
-            for item in kv_meta_chunk:
-                tasks.append(asyncio.create_task(self.generate(item)))
-            kv_metas = await asyncio.gather(*tasks)
-            return KVBatchMeta.concat(kv_metas)
+        print(f"demo get data -> generate_sequences {kv_meta_chunk}")
 
-        elif isinstance(kv_meta_chunk, KVBatchMeta):
-            kv_meta = await self.generate(kv_meta_chunk)
-            return kv_meta
-
-        else:
-            raise TypeError(f"Unsupported type for kv_meta_chunk: {type(kv_meta_chunk)}")
+        # chunk the kv_meta_chunk into a list of kv_meta and create an agentloop for each kv_meta
+        kv_meta_chunks = kv_meta_chunk.chunk(len(kv_meta_chunk))
+        tasks = []
+        for kv_meta in kv_meta_chunks:
+            tasks.append(asyncio.create_task(self.generate(kv_meta)))
+        kv_metas = await asyncio.gather(*tasks)
+        return KVBatchMeta.concat(kv_metas)
 
     async def generate(self, kv_meta):
         data = tq.kv_batch_get_by_meta(meta=kv_meta)
-        messages = data["messages"]
-
         agent_loop = AgentLoop(config=self.agent_loop_config)
-        output = await agent_loop.run(messages)
-
+        output = await agent_loop.run(data)
         kv_meta_new = tq.kv_batch_put(keys=kv_meta.keys, partition_id=kv_meta.partition_id, fields=output)
+        print(f"demo put data -> generate {kv_meta_new}")
         return kv_meta_new
 
 
@@ -420,7 +418,7 @@ class TrainerConfig:
     """Top-level configuration for :class:`Trainer`."""
 
     global_batch_size: int = 8
-    rollout_agent_num_workers: int = 2
+    rollout_agent_num_workers: int = 1
     vocab_size: int = 32000
     agent_loop: AgentLoopConfig = field(default_factory=AgentLoopConfig)
     dataset: MessageDatasetConfig = field(default_factory=MessageDatasetConfig)
@@ -475,7 +473,7 @@ class Trainer:
             logger.info(f"demo get after gen KVBatchMeta {meta}")
 
             # ========================= Compute ref log prob =========================
-            meta.fields = ["messages", "generate_sequences_ids"]
+            meta.fields = ["generate_sequences_ids"]
             meta = self.actor_rollout_wg.compute_ref_log_prob(meta)
             logger.info(f"demo get ref log prob KVBatchMeta: {meta}")
 
