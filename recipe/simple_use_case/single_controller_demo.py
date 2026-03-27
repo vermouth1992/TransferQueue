@@ -400,15 +400,14 @@ class AgentLoop:
 
 @ray.remote(num_cpus=1)
 class AgentLoopWorker:
-    def __init__(self, config):
-        self.config = config
+    def __init__(self, tq_config, agent_loop_config: AgentLoopConfig):
+        tq.init(tq_config)
+        self.agent_loop_config = agent_loop_config
 
     async def generate_sequences(self, kv_meta_chunk):
         if isinstance(kv_meta_chunk, list):
             tasks = []
             for item in kv_meta_chunk:
-                # asyncio.create_task cannot directly call Ray Actor methods,
-                # otherwise an error will be reported：a coroutine was expected, got ObjectRef(xxx)
                 tasks.append(asyncio.create_task(self.generate(item)))
             kv_metas = await asyncio.gather(*tasks)
             return KVBatchMeta.concat(kv_metas)
@@ -421,29 +420,23 @@ class AgentLoopWorker:
             raise TypeError(f"Unsupported type for kv_meta_chunk: {type(kv_meta_chunk)}")
 
     async def generate(self, kv_meta):
-        # obtain the messages from the kv_meta
         data = tq.kv_batch_get_by_meta(meta=kv_meta)
         messages = data["messages"]
 
-        # create agent loop and run it
-        agent_loop = AgentLoop(config=self.config)
+        agent_loop = AgentLoop(config=self.agent_loop_config)
         output = await agent_loop.run(messages)
 
-        # put the generated messages to the kv_meta
         kv_meta_new = tq.kv_batch_put(keys=kv_meta.keys, partition_id=kv_meta.partition_id, fields=output)
         return kv_meta_new
 
 
 class AgentLoopManager:
-    def __init__(self, config):
-        self.config = config
-        tq.init(config)
+    def __init__(self, num_workers: int, agent_loop_config: AgentLoopConfig, tq_config):
+        tq.init(tq_config)
 
         self.async_rollout_workers = []
-        num_workers = self.config.rollout_agent_num_workers
-
         for _ in range(num_workers):
-            self.async_rollout_workers.append(AgentLoopWorker.remote(config))
+            self.async_rollout_workers.append(AgentLoopWorker.remote(tq_config, agent_loop_config))
 
     def generate_sequences(self, kv_meta):
         kv_meta_chunks = kv_meta.chunk(len(self.async_rollout_workers))
@@ -477,7 +470,11 @@ class Trainer:
         tq.init(tq_config)
         self.tq_client = tq.get_client()
         self.actor_rollout_wg = ActorRolloutRefWorker()
-        self.async_rollout_manager = AgentLoopManager(self.tq_config)
+        self.async_rollout_manager = AgentLoopManager(
+            num_workers=config.rollout_agent_num_workers,
+            agent_loop_config=config.agent_loop,
+            tq_config=tq_config,
+        )
         self.dataset = MessageDataset(config.dataset)
 
     def fit(self):
