@@ -42,7 +42,6 @@ logger = logging.getLogger(__name__)
 
 os.environ["RAY_DEDUP_LOGS"] = "0"
 os.environ["RAY_DEBUG"] = "1"
-ray.init()
 
 
 def compute_log_prob(data1, _data2):
@@ -460,21 +459,26 @@ class AgentLoopManager:
         return kv_meta
 
 
+@dataclass
+class TrainerConfig:
+    """Top-level configuration for :class:`Trainer`."""
+
+    global_batch_size: int = 8
+    rollout_agent_num_workers: int = 2
+    num_n_samples: int = 2
+    agent_loop: AgentLoopConfig = field(default_factory=AgentLoopConfig)
+    dataset: MessageDatasetConfig = field(default_factory=MessageDatasetConfig)
+
+
 class Trainer:
-    def __init__(self, config):
+    def __init__(self, config: TrainerConfig, tq_config):
         self.config = config
-        tq.init(config)
+        self.tq_config = tq_config
+        tq.init(tq_config)
         self.tq_client = tq.get_client()
         self.actor_rollout_wg = ActorRolloutRefWorker()
-        self.async_rollout_manager = AgentLoopManager(self.config)
-
-        dataset_cfg = MessageDatasetConfig(
-            num_samples=config.dataset_num_samples,
-            text_length_range=tuple(config.dataset_text_length_range),
-            vocab_size=config.vocab_size,
-            num_images_range=tuple(config.dataset_num_images_range),
-        )
-        self.dataset = MessageDataset(dataset_cfg)
+        self.async_rollout_manager = AgentLoopManager(self.tq_config)
+        self.dataset = MessageDataset(config.dataset)
 
     def fit(self):
         dataloader = DataLoader(
@@ -546,32 +550,34 @@ class Trainer:
 
 
 if __name__ == "__main__":
-    # Demo-level training hyperparameters (not part of TQ config)
-    demo_conf = OmegaConf.create(
-        {
-            "global_batch_size": 8,
-            "rollout_agent_num_workers": 2,
-            "num_n_samples": 2,
-            # AgentLoop multi-turn rollout settings
-            "max_turns_range": [1, 4],
-            "tool_response_length_range": [5, 20],
-            "vocab_size": 32000,
-            "response_length": 32,
-            "image_token_length": 64,
-            # MessageDataset settings
-            "dataset_num_samples": 32,
-            "dataset_text_length_range": [10, 128],
-            "dataset_num_images_range": [0, 3],
-        }
+    ray.init()
+
+    vocab_size = 32000
+
+    trainer_config = TrainerConfig(
+        global_batch_size=8,
+        rollout_agent_num_workers=2,
+        num_n_samples=2,
+        agent_loop=AgentLoopConfig(
+            max_turns_range=(1, 4),
+            tool_response_length_range=(5, 20),
+            vocab_size=vocab_size,
+            response_length=32,
+            image_token_length=64,
+        ),
+        dataset=MessageDatasetConfig(
+            num_samples=32,
+            text_length_range=(10, 128),
+            vocab_size=vocab_size,
+            num_images_range=(0, 3),
+        ),
     )
 
     # Load default TQ config and override as needed
     tq_conf = OmegaConf.load(resources.files("transfer_queue") / "config.yaml")
     tq_conf = OmegaConf.merge(tq_conf, {"backend": {"SimpleStorage": {"num_data_storage_units": 2}}})
 
-    dict_conf = OmegaConf.merge(demo_conf, tq_conf)
-
-    trainer = Trainer(dict_conf)
+    trainer = Trainer(trainer_config, tq_conf)
     trainer.fit()
 
     ray.shutdown()
