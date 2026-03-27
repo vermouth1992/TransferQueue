@@ -28,6 +28,8 @@ import ray
 import torch
 from omegaconf import OmegaConf
 from tensordict import NonTensorData, TensorDict
+from tensordict.tensorclass import NonTensorStack
+from torch.utils.data import DataLoader, Dataset
 
 import transfer_queue as tq
 from transfer_queue import KVBatchMeta
@@ -212,6 +214,61 @@ def simulate_chat_template(
                     tokens.extend([IMAGE_TOKEN_ID] * image_token_length)
 
     return torch.tensor(tokens, dtype=torch.long)
+
+
+@dataclass
+class MessageDatasetConfig:
+    """Configuration for :class:`MessageDataset`."""
+
+    num_samples: int = 1000
+    text_length_range: tuple[int, int] = (10, 128)
+    vocab_size: int = 32000
+    num_images_range: tuple[int, int] = (0, 3)
+
+
+class MessageDataset(Dataset):
+    """Dataset that yields OpenAI-style messages with random-length text.
+
+    Each sample is a dict containing a ``"messages"`` key with the message
+    list.  Text length is sampled uniformly from ``text_length_range`` and
+    the number of images per message is sampled from ``num_images_range``.
+    """
+
+    def __init__(self, config: MessageDatasetConfig):
+        self.config = config
+
+    def __len__(self) -> int:
+        return self.config.num_samples
+
+    def __getitem__(self, idx: int) -> dict:
+        cfg = self.config
+        text_len = random.randint(*cfg.text_length_range)
+        num_images = random.randint(*cfg.num_images_range)
+
+        words = [str(random.randint(0, cfg.vocab_size - 1)) for _ in range(text_len)]
+        text = " ".join(words)
+
+        content: list[dict] = []
+        for _ in range(num_images):
+            content.append({"type": "image_url", "image_url": {"url": "simulated"}})
+        content.append({"type": "text", "text": text})
+
+        messages = [{"role": "user", "content": content}]
+        return {"messages": messages}
+
+
+def message_collate_fn(batch: list[dict]) -> TensorDict:
+    """Collate a batch of message dicts into a ``TensorDict``.
+
+    Each sample's ``"messages"`` list is stored as a ``NonTensorStack``
+    entry so that the entire batch can be represented as a single
+    ``TensorDict`` with ``batch_size == len(batch)``.
+    """
+    messages_list = [sample["messages"] for sample in batch]
+    return TensorDict(
+        {"messages": NonTensorStack(*messages_list)},
+        batch_size=len(batch),
+    )
 
 
 @dataclass
@@ -411,78 +468,80 @@ class Trainer:
         self.actor_rollout_wg = ActorRolloutRefWorker()
         self.async_rollout_manager = AgentLoopManager(self.config)
 
+        dataset_cfg = MessageDatasetConfig(
+            num_samples=config.dataset_num_samples,
+            text_length_range=tuple(config.dataset_text_length_range),
+            vocab_size=config.vocab_size,
+            num_images_range=tuple(config.dataset_num_images_range),
+        )
+        self.dataset = MessageDataset(dataset_cfg)
+
     def fit(self):
-        for _epoch in range(1):
-            train_dataloader = 1
-            for step in range(train_dataloader):
-                # ========================= Construct prompt batch data =========================
-                input_ids = (
-                    torch.tensor([[1, 2], [3, 4], [5, 6], [7, 8], [9, 10], [100, 111], [200, 222], [300, 333]])
-                ) * (step + 1)
-                input_ids_repeated = torch.repeat_interleave(input_ids, self.config.num_n_samples, dim=0)
-                batch_keys = [str(uuid.uuid4()) for _ in range(len(input_ids_repeated))]
-                prompt_batch = TensorDict(
-                    {"input_ids": input_ids_repeated, "attention_mask": input_ids_repeated},
-                    batch_size=input_ids_repeated.size(0),
-                )
+        dataloader = DataLoader(
+            self.dataset,
+            batch_size=self.config.global_batch_size,
+            shuffle=True,
+            collate_fn=message_collate_fn,
+        )
 
-                # ========================= Put prompts to TQ system =========================
-                tq.kv_batch_put(keys=batch_keys, partition_id=f"train_{step}", fields=prompt_batch)
-                logger.info("demo put prompts ok! ")
-                time.sleep(5)
+        for step, batch in enumerate(dataloader):
+            logger.info(f"Step {step}: batch_size = {batch.batch_size[0]}")
 
-                # ========================= Sample generate KVBatchMeta =========================
-                sampled_keys = random.sample(batch_keys, self.config.global_batch_size)
-                meta = KVBatchMeta(
-                    keys=sampled_keys,
-                    tags=[{} for _ in sampled_keys],
-                    partition_id=f"train_{step}",
-                    fields=["input_ids", "attention_mask"],
-                )
-                logger.info(f"demo get KVBatchMeta {meta}")
+            # ========================= Generate keys and put messages to TQ =========================
+            batch_keys = [str(uuid.uuid4()) for _ in range(batch.batch_size[0])]
+            tq.kv_batch_put(keys=batch_keys, partition_id=f"train_{step}", fields=batch)
+            logger.info("demo put messages ok!")
+            time.sleep(5)
 
-                # ========================= Rollout: generate sequences =========================
-                meta = self.async_rollout_manager.generate_sequences(meta)
-                logger.info(f"demo get after gen KVBatchMeta {meta}")
+            # ========================= Sample generate KVBatchMeta =========================
+            sampled_keys = random.sample(batch_keys, min(self.config.global_batch_size, len(batch_keys)))
+            meta = KVBatchMeta(
+                keys=sampled_keys,
+                tags=[{} for _ in sampled_keys],
+                partition_id=f"train_{step}",
+                fields=["messages"],
+            )
+            logger.info(f"demo get KVBatchMeta {meta}")
 
-                # ========================= Compute ref log prob =========================
-                meta.fields = ["input_ids", "attention_mask", "generate_sequences_ids"]
-                meta = self.actor_rollout_wg.compute_ref_log_prob(meta)
-                logger.info(f"demo get ref log prob KVBatchMeta: {meta}")
+            # ========================= Rollout: generate sequences =========================
+            meta = self.async_rollout_manager.generate_sequences(meta)
+            logger.info(f"demo get after gen KVBatchMeta {meta}")
 
-                # ========================= Compute old log prob =========================
-                meta.fields = ["input_ids", "attention_mask", "generate_sequences_ids"]
-                meta = self.actor_rollout_wg.compute_log_prob(meta)
-                logger.info(f"demo get old log prob KVBatchMeta: {meta}")
+            # ========================= Compute ref log prob =========================
+            meta.fields = ["messages", "generate_sequences_ids"]
+            meta = self.actor_rollout_wg.compute_ref_log_prob(meta)
+            logger.info(f"demo get ref log prob KVBatchMeta: {meta}")
 
-                # ========================= Compute reward =========================
-                # Simulated inline; in real training this calls a reward model worker
-                meta.fields = ["generate_sequences_ids", "ref_log_prob", "old_log_prob"]
-                logger.info("demo computing reward (simulated)")
-                time.sleep(1)
-                logger.info(f"demo reward KVBatchMeta: {meta}")
+            # ========================= Compute old log prob =========================
+            meta.fields = ["messages", "generate_sequences_ids"]
+            meta = self.actor_rollout_wg.compute_log_prob(meta)
+            logger.info(f"demo get old log prob KVBatchMeta: {meta}")
 
-                # ========================= Update actor =========================
-                meta.fields = [
-                    "input_ids",
-                    "attention_mask",
-                    "generate_sequences_ids",
-                    "old_log_prob",
-                    "ref_log_prob",
-                ]
-                meta = self.actor_rollout_wg.update_actor(meta)
-                logger.info(f"demo get after update actor KVBatchMeta: {meta}")
+            # ========================= Compute reward =========================
+            meta.fields = ["generate_sequences_ids", "ref_log_prob", "old_log_prob"]
+            logger.info("demo computing reward (simulated)")
+            time.sleep(1)
+            logger.info(f"demo reward KVBatchMeta: {meta}")
 
-                # ========================= Sync weights to rollout =========================
-                asyncio.run(self.actor_rollout_wg.update_weights(global_steps=step))
-                logger.info("demo update weights done")
+            # ========================= Update actor =========================
+            meta.fields = [
+                "messages",
+                "generate_sequences_ids",
+                "old_log_prob",
+                "ref_log_prob",
+            ]
+            meta = self.actor_rollout_wg.update_actor(meta)
+            logger.info(f"demo get after update actor KVBatchMeta: {meta}")
 
-                # ========================= Clear partition in TQ =========================
-                self.tq_client.clear_partition(partition_id=f"train_{step}")
-                logger.info("clear ok! ")
+            # ========================= Sync weights to rollout =========================
+            asyncio.run(self.actor_rollout_wg.update_weights(global_steps=step))
+            logger.info("demo update weights done")
+
+            # ========================= Clear partition in TQ =========================
+            self.tq_client.clear_partition(partition_id=f"train_{step}")
+            logger.info("clear ok!")
+
         logger.info("demo done!")
-
-        # Cleanup resources
         self.tq_client.close()
 
 
@@ -491,7 +550,6 @@ if __name__ == "__main__":
     demo_conf = OmegaConf.create(
         {
             "global_batch_size": 8,
-            "num_global_batch": 1,
             "rollout_agent_num_workers": 2,
             "num_n_samples": 2,
             # AgentLoop multi-turn rollout settings
@@ -500,6 +558,10 @@ if __name__ == "__main__":
             "vocab_size": 32000,
             "response_length": 32,
             "image_token_length": 64,
+            # MessageDataset settings
+            "dataset_num_samples": 32,
+            "dataset_text_length_range": [10, 128],
+            "dataset_num_images_range": [0, 3],
         }
     )
 
