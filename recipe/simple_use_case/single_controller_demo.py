@@ -345,7 +345,7 @@ class AgentLoop:
 @ray.remote(num_cpus=1)
 class AgentLoopWorker:
     def __init__(self, config):
-        self.async_vllm_server = AsyncvLLMServer.remote(config)
+        self.config = config
 
     async def generate_sequences(self, kv_meta_chunk):
         if isinstance(kv_meta_chunk, list):
@@ -365,7 +365,16 @@ class AgentLoopWorker:
             raise TypeError(f"Unsupported type for kv_meta_chunk: {type(kv_meta_chunk)}")
 
     async def generate(self, kv_meta):
-        kv_meta_new = await self.async_vllm_server.generate.remote(kv_meta)
+        # obtain the messages from the kv_meta
+        data = tq.kv_batch_get_by_meta(meta=kv_meta)
+        messages = data["messages"]
+
+        # create agent loop and run it
+        agent_loop = AgentLoop(config=self.config)
+        output = await agent_loop.run(messages)
+
+        # put the generated messages to the kv_meta
+        kv_meta_new = tq.kv_batch_put(keys=kv_meta.keys, partition_id=kv_meta.partition_id, fields=output)
         return kv_meta_new
 
 
