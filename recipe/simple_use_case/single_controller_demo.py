@@ -55,6 +55,17 @@ def compute_loss(data1, _data2):
     return data1
 
 
+def compute_reward(response_ids: torch.Tensor) -> TensorDict:
+    """Simulate a reward model that scores each token position in the response.
+
+    Returns a TensorDict with an ``"advantage"`` field whose shape matches
+    ``response_ids`` (i.e. one scalar per response token).
+    """
+    time.sleep(1)
+    advantage = torch.randn_like(response_ids, dtype=torch.float32)
+    return TensorDict({"advantage": advantage}, batch_size=response_ids.size(0))
+
+
 class TrainingWorker:
     def __init__(self, role):
         self.role = role
@@ -486,14 +497,17 @@ class Trainer:
 
             # ========================= Compute reward =========================
             meta.fields = ["response_ids", "ref_log_prob", "old_log_prob"]
-            logger.info("demo computing reward (simulated)")
-            time.sleep(1)
+            reward_data = tq.kv_batch_get_by_meta(meta=meta)
+            reward_output = compute_reward(reward_data["response_ids"])
+            meta = tq.kv_batch_put(keys=meta.keys, partition_id=meta.partition_id, fields=reward_output)
             logger.info(f"demo reward KVBatchMeta: {meta}")
 
             # ========================= Update actor =========================
             meta.fields = [
-                "messages",
-                "generate_sequences_ids",
+                "input_ids",
+                "response_ids",
+                "response_mask",
+                "advantage",
                 "old_log_prob",
                 "ref_log_prob",
             ]
@@ -526,7 +540,7 @@ if __name__ == "__main__":
             image_token_length=64,
         ),
         dataset=MessageDatasetConfig(
-            num_samples=32,
+            num_samples=16,
             text_length_range=(10, 128),
             num_images_range=(0, 3),
         ),
