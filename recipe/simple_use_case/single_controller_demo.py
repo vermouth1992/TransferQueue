@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import argparse
 import asyncio
 import logging
 import os
@@ -526,29 +527,60 @@ class Trainer:
         self.tq_client.close()
 
 
-if __name__ == "__main__":
-    ray.init()
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Single-controller TransferQueue demo")
 
-    trainer_config = TrainerConfig(
-        global_batch_size=8,
-        rollout_agent_num_workers=2,
-        vocab_size=32000,
+    # TrainerConfig
+    parser.add_argument("--global-batch-size", type=int, default=8)
+    parser.add_argument("--rollout-agent-num-workers", type=int, default=2)
+    parser.add_argument("--vocab-size", type=int, default=32000)
+
+    # AgentLoopConfig
+    parser.add_argument("--max-turns-range", type=int, nargs=2, default=[1, 4], metavar=("MIN", "MAX"))
+    parser.add_argument("--tool-response-length-range", type=int, nargs=2, default=[5, 20], metavar=("MIN", "MAX"))
+    parser.add_argument("--response-length", type=int, default=32)
+    parser.add_argument("--image-token-length", type=int, default=64)
+
+    # MessageDatasetConfig
+    parser.add_argument("--num-samples", type=int, default=16)
+    parser.add_argument("--text-length-range", type=int, nargs=2, default=[10, 128], metavar=("MIN", "MAX"))
+    parser.add_argument("--num-images-range", type=int, nargs=2, default=[0, 3], metavar=("MIN", "MAX"))
+
+    # TQ backend
+    parser.add_argument("--num-data-storage-units", type=int, default=2)
+
+    return parser.parse_args()
+
+
+def build_config(args: argparse.Namespace) -> TrainerConfig:
+    return TrainerConfig(
+        global_batch_size=args.global_batch_size,
+        rollout_agent_num_workers=args.rollout_agent_num_workers,
+        vocab_size=args.vocab_size,
         agent_loop=AgentLoopConfig(
-            max_turns_range=(1, 4),
-            tool_response_length_range=(5, 20),
-            response_length=32,
-            image_token_length=64,
+            max_turns_range=tuple(args.max_turns_range),
+            tool_response_length_range=tuple(args.tool_response_length_range),
+            response_length=args.response_length,
+            image_token_length=args.image_token_length,
         ),
         dataset=MessageDatasetConfig(
-            num_samples=16,
-            text_length_range=(10, 128),
-            num_images_range=(0, 3),
+            num_samples=args.num_samples,
+            text_length_range=tuple(args.text_length_range),
+            num_images_range=tuple(args.num_images_range),
         ),
     )
 
-    # Load default TQ config and override as needed
+
+if __name__ == "__main__":
+    args = parse_args()
+    ray.init()
+
+    trainer_config = build_config(args)
+
     tq_conf = OmegaConf.load(resources.files("transfer_queue") / "config.yaml")
-    tq_conf = OmegaConf.merge(tq_conf, {"backend": {"SimpleStorage": {"num_data_storage_units": 2}}})
+    tq_conf = OmegaConf.merge(
+        tq_conf, {"backend": {"SimpleStorage": {"num_data_storage_units": args.num_data_storage_units}}}
+    )
 
     trainer = Trainer(trainer_config, tq_conf)
     trainer.fit()
