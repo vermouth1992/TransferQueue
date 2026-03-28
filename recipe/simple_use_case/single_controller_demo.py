@@ -135,20 +135,16 @@ class ActorRolloutRefWorker:
         await asyncio.sleep(1)
 
 
-
 async def generate(prompt: torch.Tensor, response_length: int, vocab_size: int) -> torch.Tensor:
     assert prompt.ndim == 1
     response = torch.randint(low=0, high=vocab_size, size=(response_length,), dtype=torch.long)
     return response
 
 
-
 IMAGE_TOKEN_ID = 32001
 
 
-def simulate_chat_template(
-    messages: list[dict], vocab_size: int, image_token_length: int = 64
-) -> torch.Tensor:
+def simulate_chat_template(messages: list[dict], vocab_size: int, image_token_length: int = 64) -> torch.Tensor:
     """Simulate ``tokenizer.apply_chat_template`` with interleaved image support.
 
     Each message follows the OpenAI-style multi-modal format::
