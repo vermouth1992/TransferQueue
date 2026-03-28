@@ -45,8 +45,9 @@ os.environ["RAY_DEBUG"] = "1"
 
 
 def compute_log_prob(data1, _data2):
+    print(f"compute_log_prob: data1 {data1}, data2 {_data2}")
     time.sleep(3)
-    return data1
+    return _data2
 
 
 def compute_loss(data1, _data2):
@@ -84,7 +85,7 @@ class TrainingWorker:
         logger.info(f"compute_log_prob: got data {data}")
 
         # 2. Model forward
-        output = compute_log_prob(data["input_ids"], data["generate_sequences_ids"])
+        output = compute_log_prob(data["prompt_ids"], data["response_ids"])
         if self.role == "actor":
             output = TensorDict({"old_log_prob": output}, batch_size=output.size(0))
         elif self.role == "ref":
@@ -280,9 +281,9 @@ class AgentLoop:
 
             - ``"input_ids"`` — concatenation of prompt and response,
               shape ``[1, prompt_len + response_len]``.
-            - ``"prompt"`` — token IDs of the original message, shape
+            - ``"prompt_ids"`` — token IDs of the original message, shape
               ``[1, prompt_len]``.
-            - ``"response"`` — all generated tokens (generations + tool
+            - ``"response_ids"`` — all generated tokens (generations + tool
               responses across every turn), shape ``[1, response_len]``.
             - ``"response_mask"`` — ``1`` for model-generated tokens,
               ``0`` for tool-response tokens, shape ``[1, response_len]``.
@@ -333,16 +334,17 @@ class AgentLoop:
         response_mask = torch.cat(mask_parts) if mask_parts else torch.tensor([], dtype=torch.long)
         input_ids = torch.cat([prompt, response])
 
-        return TensorDict(
+        data = TensorDict(
             {
                 "input_ids": input_ids.unsqueeze(0),
-                "prompt": prompt.unsqueeze(0),
-                "response": response.unsqueeze(0),
+                "prompt_ids": prompt.unsqueeze(0),
+                "response_ids": response.unsqueeze(0),
                 "response_mask": response_mask.unsqueeze(0),
                 "num_turns": torch.tensor([turn + 1]),
             },
             batch_size=1,
         )
+        return data
 
     def _detect_tool_call(self, turn: int, num_turns: int) -> bool:
         """Simulate tool-call detection.
@@ -473,17 +475,17 @@ class Trainer:
             logger.info(f"demo get after gen KVBatchMeta {meta}")
 
             # ========================= Compute ref log prob =========================
-            meta.fields = ["generate_sequences_ids"]
+            meta.fields = ["prompt_ids", "response_ids", "input_ids"]
             meta = self.actor_rollout_wg.compute_ref_log_prob(meta)
             logger.info(f"demo get ref log prob KVBatchMeta: {meta}")
 
             # ========================= Compute old log prob =========================
-            meta.fields = ["messages", "generate_sequences_ids"]
+            meta.fields = ["prompt_ids", "response_ids", "input_ids"]
             meta = self.actor_rollout_wg.compute_log_prob(meta)
             logger.info(f"demo get old log prob KVBatchMeta: {meta}")
 
             # ========================= Compute reward =========================
-            meta.fields = ["generate_sequences_ids", "ref_log_prob", "old_log_prob"]
+            meta.fields = ["response_ids", "ref_log_prob", "old_log_prob"]
             logger.info("demo computing reward (simulated)")
             time.sleep(1)
             logger.info(f"demo reward KVBatchMeta: {meta}")
